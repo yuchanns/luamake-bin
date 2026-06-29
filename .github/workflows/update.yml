@@ -1,0 +1,165 @@
+name: update luamake binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even when the upstream commit did not change'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-luamake-binaries
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check upstream commit
+    runs-on: ubuntu-latest
+    outputs:
+      latest_commit: ${{ steps.latest.outputs.commit }}
+      current_commit: ${{ steps.compare.outputs.current }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Get latest luamake commit
+        id: latest
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const { data: commit } = await github.rest.repos.getCommit({
+              owner: 'actboy168',
+              repo: 'luamake',
+              ref: 'master',
+            });
+            core.setOutput('commit', commit.sha);
+      - name: Compare cached commit
+        id: compare
+        shell: bash
+        run: |
+          current=""
+          if [[ -f luamake-commit.txt ]]; then
+            current="$(tr -d '[:space:]' < luamake-commit.txt)"
+          fi
+
+          latest="${{ steps.latest.outputs.commit }}"
+          force="${{ github.event_name == 'workflow_dispatch' && inputs.force == 'true' }}"
+
+          if [[ "$force" == "true" || "$current" != "$latest" ]]; then
+            should_build="true"
+          else
+            should_build="false"
+          fi
+
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
+          echo "Current commit: ${current:-<none>}"
+          echo "Latest commit: $latest"
+          echo "Should build: $should_build"
+
+  build:
+    name: build ${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            bin-dir: linux
+            exe: luamake
+          - name: linux_arm64
+            os: ubuntu-24.04-arm
+            bin-dir: linux_arm64
+            exe: luamake
+          - name: osx
+            os: macos-15-intel
+            bin-dir: osx
+            exe: luamake
+          - name: osx_arm64
+            os: macos-15
+            bin-dir: osx_arm64
+            exe: luamake
+          - name: win32
+            os: windows-latest
+            bin-dir: win32
+            exe: luamake.exe
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build standalone luamake
+        uses: yuchanns/actions-luamake@v1
+        with:
+          luamake-version: ${{ needs.check.outputs.latest_commit }}
+          standalone: 'true'
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p artifact
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            source="$(command -v luamake || true)"
+            if [[ -z "$source" ]]; then
+              source="/c/Windows/System32/${{ matrix.exe }}"
+            fi
+          else
+            source="$(command -v luamake)"
+          fi
+          cp "$source" "artifact/${{ matrix.exe }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: luamake-${{ matrix.name }}
+          path: artifact/${{ matrix.exe }}
+          if-no-files-found: error
+
+  publish:
+    name: publish binaries
+    needs:
+      - check
+      - build
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: downloaded
+      - name: Update repository binaries
+        shell: bash
+        run: |
+          rm -rf bin
+          mkdir -p bin/linux bin/linux_arm64 bin/osx bin/osx_arm64 bin/win32
+
+          cp downloaded/luamake-linux/luamake bin/linux/luamake
+          cp downloaded/luamake-linux_arm64/luamake bin/linux_arm64/luamake
+          cp downloaded/luamake-osx/luamake bin/osx/luamake
+          cp downloaded/luamake-osx_arm64/luamake bin/osx_arm64/luamake
+          cp downloaded/luamake-win32/luamake.exe bin/win32/luamake.exe
+
+          chmod +x bin/linux/luamake
+          chmod +x bin/linux_arm64/luamake
+          chmod +x bin/osx/luamake
+          chmod +x bin/osx_arm64/luamake
+
+          printf '%s\n' '${{ needs.check.outputs.latest_commit }}' > luamake-commit.txt
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add bin luamake-commit.txt
+
+          if git diff --cached --quiet; then
+            echo "No binary changes to commit."
+            exit 0
+          fi
+
+          short_commit="$(printf '%s' '${{ needs.check.outputs.latest_commit }}' | cut -c1-12)"
+          git commit -m "Update luamake standalone binaries to $short_commit"
+          git push
